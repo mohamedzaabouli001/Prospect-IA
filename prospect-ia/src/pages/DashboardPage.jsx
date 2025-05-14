@@ -119,7 +119,7 @@ function DashboardPage() {
                             <Route path="/campagnes/add" element={<AddCampagnesPage />} />
                             <Route path="/campagnes/edit/:id" element={<EditCampaign />} />
                             <Route path="/campagnes/view/:id" element={<ViewCampaign />} />
-                            <Route path="/campagnes/results/:id" element={<CampaignResults />} />
+
                             {/* Route pour le profil utilisateur */}
                             <Route path="/profile" element={<div>Page de profil - À implémenter</div>} />
                             {/* Route pour l'aide */}

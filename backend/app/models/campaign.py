@@ -69,3 +69,6 @@ class Campaign(Base):
     # Relations
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     user = relationship("User", back_populates="campaigns")
+
+    # leads = relationship("Lead", back_populates="campaign")
+    # lead_collections = relationship("LeadCollection", back_populates="campaign")

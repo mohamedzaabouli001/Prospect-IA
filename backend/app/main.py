@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.database import engine, Base
-from app.routes import auth
-from app.routes import campaign
+from app.routes import auth, campaign
+
+
+
 
 # Créer les tables dans la base de données
 Base.metadata.create_all(bind=engine)
@@ -27,6 +29,9 @@ app.add_middleware(
 # Inclure les routes
 app.include_router(auth.router)
 app.include_router(campaign.router)
+# app.include_router(dashboard.router)
+# app.include_router(test_scraper.router)
+# app.include_router(lead.router)
 
 # Route de base pour vérifier que l'API fonctionne
 @app.get("/")
