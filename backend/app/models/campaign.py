@@ -72,3 +72,5 @@ class Campaign(Base):
 
     # leads = relationship("Lead", back_populates="campaign")
     # lead_collections = relationship("LeadCollection", back_populates="campaign")
+    leads = relationship("Lead", back_populates="campaign")
+ 
