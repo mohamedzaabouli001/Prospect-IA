@@ -5,7 +5,6 @@ from sqlalchemy.orm import Session
 import json
 from typing import List, Optional
 import io
-
 from app.database import get_db
 from app.models.lead import Lead
 from app.models.campaign import Campaign
@@ -146,242 +145,256 @@ def process_leads_data(leads_data, background_tasks, db, current_user):
             db.add(new_lead)
             db.commit()
             db.refresh(new_lead)
-            db_leads.append(new_lead)
-    
-    # Lancer l'analyse en arrière-plan
-    if db_leads:
-        background_tasks.add_task(analyze_leads, db_session_factory=db.flush, leads_ids=[lead.id for lead in db_leads])
-    
+            db_leads.append(new_lead)   
     return db_leads
 
 
-def analyze_leads(db_session_factory, leads_ids):
+@router.get("/campaign/{campaign_id}/ml-matching", response_model=List[LeadSchema])
+def get_ml_compatible_leads(
+    campaign_id: int,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """
-    Analyser les leads et calculer leur compatibilité avec les campagnes.
-    Cette fonction est exécutée en arrière-plan.
+    Utilise le machine learning pour trouver les leads les plus compatibles avec une campagne spécifique.
     """
-    # Créer une nouvelle session de base de données
-    SessionLocal = sessionmaker(bind=db_session_factory)
-    db = SessionLocal()
+    # Vérifier que la campagne existe et appartient à l'utilisateur courant
+    campaign = db.query(Campaign).filter(
+        Campaign.id == campaign_id, 
+        Campaign.user_id == current_user.id
+    ).first()
     
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campagne non trouvée")
+    
+    # Récupérer tous les leads disponibles
+    leads = db.query(Lead).all()
+    
+    if not leads:
+        return []
+    
+    # Préparer les données pour l'analyse ML
+    campaign_features = extract_campaign_features(campaign)
+    lead_features = [extract_lead_features(lead) for lead in leads]
+    
+    # Utiliser TF-IDF pour vectoriser les caractéristiques textuelles
+    vectorizer = TfidfVectorizer(stop_words='french')
+    
+    # Combiner les caractéristiques pour l'entraînement
+    all_features = [campaign_features] + lead_features
+    
+    # Vectoriser toutes les caractéristiques
     try:
-        # Récupérer les leads à analyser
-        leads = db.query(Lead).filter(Lead.id.in_(leads_ids)).all()
-        
-        if not leads:
-            return
-        
-        # Récupérer toutes les campagnes actives
-        campaigns = db.query(Campaign).filter(Campaign.status == "active").all()
-        
-        if not campaigns:
-            return
-        
-        # Préparer les caractéristiques des campagnes
-        campaign_features = []
-        for campaign in campaigns:
-            features = {
-                "target_industry": ", ".join(campaign.target_industry) if isinstance(campaign.target_industry, list) else str(campaign.target_industry),
-                "target_geography": campaign.target_geography,
-                "business_type": campaign.business_type,
-                "target_company_size": ", ".join(campaign.target_company_size) if isinstance(campaign.target_company_size, list) and campaign.target_company_size else "",
-                "target_job": campaign.target_job,
-                "product_name": campaign.product_name,
-                "product_benefits": campaign.product_benefits,
-                "product_usp": campaign.product_usp
-            }
-            
-            # Concaténer les caractéristiques en une seule chaîne
-            feature_text = " ".join([str(value) for value in features.values() if value])
-            campaign_features.append(feature_text)
-        
-        # Préparer les caractéristiques des leads
-        lead_features = []
-        for lead in leads:
-            # Extraire le domaine des emails
-            email_domains = []
-            if lead.emails:
-                for email in lead.emails:
-                    if '@' in email:
-                        domain = email.split('@')[1]
-                        email_domains.append(domain)
-            
-            # Compter les réseaux sociaux actifs
-            social_count = sum(1 for x in [
-                lead.instagrams, lead.facebooks, lead.linkedIns, 
-                lead.youtubes, lead.tiktoks, lead.twitters
-            ] if x and len(x) > 0)
-            
-            # Estimer la taille de l'entreprise
-            if not lead.company_size:
-                if social_count >= 3 and lead.reviewsCount and lead.reviewsCount > 50:
-                    lead.company_size = "grande"
-                elif social_count >= 2 or (lead.reviewsCount and lead.reviewsCount > 20):
-                    lead.company_size = "moyenne"
-                else:
-                    lead.company_size = "petite"
-            
-            # Préparer les caractéristiques
-            features = {
-                "title": lead.title,
-                "city": lead.city or "",
-                "industry": lead.industry or "",
-                "company_size": lead.company_size or "",
-                "email_domains": " ".join(email_domains),
-                "website": lead.website or "",
-                "social_presence": f"Présence sur {social_count} réseaux sociaux" if social_count > 0 else ""
-            }
-            
-            # Concaténer les caractéristiques en une seule chaîne
-            feature_text = " ".join([str(value) for value in features.values() if value])
-            lead_features.append(feature_text)
-        
-        # Utiliser TF-IDF pour vectoriser les caractéristiques
-        vectorizer = TfidfVectorizer(stop_words='french')
-        
-        # Combiner les caractéristiques pour l'entraînement
-        all_features = campaign_features + lead_features
-        
-        # Vérifier s'il y a des caractéristiques pour vectoriser
-        if not all_features or all(not feature.strip() for feature in all_features):
-            # Pas assez de données pour l'analyse
-            return
-        
-        # Vectoriser toutes les caractéristiques
         tfidf_matrix = vectorizer.fit_transform(all_features)
+    except:
+        # Si les données sont insuffisantes, retourner une liste vide
+        return []
+    
+    # Séparer les vecteurs de la campagne et des leads
+    campaign_vector = tfidf_matrix[0:1]
+    leads_vectors = tfidf_matrix[1:]
+    
+    # Calculer la similarité cosinus entre chaque lead et la campagne
+    similarities = cosine_similarity(leads_vectors, campaign_vector).flatten()
+    
+    # Appliquer des boosts spécifiques selon le type de campagne
+    lead_scores = []
+    for i, lead in enumerate(leads):
+        base_score = similarities[i]
         
-        # Séparer les vecteurs de campagnes et de leads
-        campaign_vectors = tfidf_matrix[:len(campaigns)]
-        lead_vectors = tfidf_matrix[len(campaigns):]
+        # Appliquer les boosts en fonction du type de la campagne
+        final_score = apply_campaign_specific_boosts(base_score, lead, campaign)
         
-        # Calculer la similarité cosinus entre chaque lead et chaque campagne
-        similarities = cosine_similarity(lead_vectors, campaign_vectors)
+        lead_scores.append((lead, final_score))
+    
+    # Trier les leads par score de pertinence
+    sorted_leads = sorted(lead_scores, key=lambda x: x[1], reverse=True)
+    
+    # Mettre à jour les scores dans la base de données
+    for lead, score in sorted_leads[:limit]:
+        lead.compatibility_score = score
+        lead.processed = True
         
-        # Mise à jour des scores de compatibilité
-        for i, lead in enumerate(leads):
-            # Trouver la campagne avec la meilleure compatibilité
-            best_campaign_idx = np.argmax(similarities[i])
-            best_score = similarities[i][best_campaign_idx]
-            
-            # Appliquer des facteurs de boost basés sur d'autres critères
-            
-            # Boost 1: Plus de notes = plus fiable
-            review_boost = min(1.2, 1 + (lead.reviewsCount or 0) / 1000)
-            
-            # Boost 2: Score élevé = plus fiable
-            score_boost = min(1.2, 1 + (lead.totalScore or 0) / 5)
-            
-            # Boost 3: Présence d'emails = plus accessible
-            email_boost = 1.3 if lead.emails and len(lead.emails) > 0 else 1.0
-            
-            # Calculer le score final
-            final_score = best_score * review_boost * score_boost * email_boost
-            
-            # Normaliser entre 0 et 1
-            final_score = min(1.0, final_score)
-            
-            # Mettre à jour le lead
-            lead.compatibility_score = float(final_score)
-            lead.processed = True
-            
-            # Si le score est suffisamment élevé, associer le lead à la campagne
-            if final_score > 0.5:  # Seuil de similarité
-                lead.campaign_id = campaigns[best_campaign_idx].id
-                lead.status = "qualified"
-            else:
-                lead.campaign_id = None
-                lead.status = "new"
-            
-        # Enregistrer les modifications
-        db.commit()
+        # Associer les leads avec un score élevé à la campagne
+        if score > 0.7:
+            lead.campaign_id = campaign_id
+            lead.status = "qualified"
+        elif score > 0.4:
+            lead.status = "potential"
     
-    except Exception as e:
-        print(f"Erreur lors de l'analyse des leads: {str(e)}")
-        db.rollback()
+    db.commit()
     
-    finally:
-        db.close()
+    # Retourner les meilleurs leads
+    return [lead for lead, _ in sorted_leads[:limit]]
 
+def extract_campaign_features(campaign: Campaign) -> str:
+    """
+    Extraire les caractéristiques textuelles d'une campagne pour l'analyse ML.
+    """
+    features = []
+    
+    # Informations de base
+    features.append(f"campagne: {campaign.campaign_name}")
+    features.append(f"objectif: {campaign.campaign_objective}")
+    features.append(f"type entreprise: {campaign.business_type}")
+    
+    # Industrie cible
+    if isinstance(campaign.target_industry, list):
+        for industry in campaign.target_industry:
+            features.append(f"industrie cible: {industry}")
+    else:
+        features.append(f"industrie cible: {campaign.target_industry}")
+    
+    # Taille d'entreprise cible
+    if campaign.target_company_size and isinstance(campaign.target_company_size, list):
+        for size in campaign.target_company_size:
+            features.append(f"taille cible: {size}")
+    
+    # Géographie cible
+    features.append(f"géographie: {campaign.target_geography}")
+    
+    # Informations sur l'offre
+    features.append(f"type offre: {campaign.offer_type}")
+    if campaign.product_category:
+        features.append(f"catégorie produit: {campaign.product_category}")
+    features.append(f"produit: {campaign.product_name}")
+    features.append(f"description: {campaign.product_description}")
+    features.append(f"avantages: {campaign.product_benefits}")
+    features.append(f"proposition unique: {campaign.product_usp}")
+    
+    # Mots-clés supplémentaires pour certains types de produits
+    if "site web" in campaign.product_name.lower() or "site internet" in campaign.product_name.lower():
+        features.append("mots-clés: site web création présence en ligne digital internet visibilité")
+    elif "marketing" in campaign.product_name.lower():
+        features.append("mots-clés: marketing publicité visibilité acquisition clients")
+    elif "logiciel" in campaign.product_name.lower() or "application" in campaign.product_name.lower():
+        features.append("mots-clés: logiciel application digitalisation automatisation productivité")
+    
+    return " ".join(features)
 
-# Ajoutez cet endpoint à app/routes/lead.py
+def extract_lead_features(lead: Lead) -> str:
+    """
+    Extraire les caractéristiques textuelles d'un lead pour l'analyse ML.
+    """
+    features = []
+    
+    # Informations de base
+    features.append(f"nom: {lead.title}")
+    
+    if lead.industry:
+        features.append(f"industrie: {lead.industry}")
+    
+    if lead.company_size:
+        features.append(f"taille: {lead.company_size}")
+    
+    if lead.city:
+        features.append(f"ville: {lead.city}")
+    
+    # Présence digitale
+    if lead.website:
+        features.append("a un site web")
+    else:
+        features.append("pas de site web")
+    
+    # Réseaux sociaux
+    social_count = 0
+    social_platforms = []
+    
+    if lead.facebooks and len(lead.facebooks) > 0:
+        social_count += 1
+        social_platforms.append("facebook")
+    
+    if lead.instagrams and len(lead.instagrams) > 0:
+        social_count += 1
+        social_platforms.append("instagram")
+    
+    if lead.linkedIns and len(lead.linkedIns) > 0:
+        social_count += 1
+        social_platforms.append("linkedin")
+    
+    if lead.youtubes and len(lead.youtubes) > 0:
+        social_count += 1
+        social_platforms.append("youtube")
+    
+    features.append(f"présence sociale: {social_count}")
+    if social_platforms:
+        features.append(f"plateformes: {' '.join(social_platforms)}")
+    
+    # Indicateurs de qualité
+    if lead.totalScore and lead.totalScore > 0:
+        features.append(f"score: {lead.totalScore}")
+        if lead.totalScore >= 4.5:
+            features.append("très bien noté")
+        elif lead.totalScore >= 4.0:
+            features.append("bien noté")
+    
+    if lead.reviewsCount and lead.reviewsCount > 0:
+        features.append(f"nombre avis: {lead.reviewsCount}")
+        if lead.reviewsCount >= 100:
+            features.append("très populaire")
+        elif lead.reviewsCount >= 50:
+            features.append("populaire")
+        elif lead.reviewsCount >= 10:
+            features.append("quelques avis")
+    
+    # Contactabilité
+    if lead.emails and len(lead.emails) > 0:
+        features.append("a des emails")
+    
+    if lead.phone:
+        features.append("a un téléphone")
+    
+    return " ".join(features)
 
-@router.get("/campaign/{campaign_id}/compatible", response_model=List[LeadSchema])
-def get_compatible_leads(
-    campaign_id: int,
-    min_score: float = 0.5,
-    limit: int = 20,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
+def apply_campaign_specific_boosts(base_score: float, lead: Lead, campaign: Campaign) -> float:
     """
-    Récupérer les leads les plus compatibles avec une campagne spécifique.
+    Appliquer des boosts spécifiques en fonction du type de campagne.
     """
-    # Vérifier que la campagne appartient à l'utilisateur
-    campaign = db.query(Campaign).filter(
-        Campaign.id == campaign_id, 
-        Campaign.user_id == current_user.id
-    ).first()
+    product_name = campaign.product_name.lower()
+    final_score = base_score
     
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campagne non trouvée")
+    # Boosts généraux
+    if lead.emails and len(lead.emails) > 0:
+        final_score *= 1.2  # Meilleur score si des emails sont disponibles
     
-    # Récupérer les leads compatibles
-    compatible_leads = db.query(Lead).filter(
-        Lead.campaign_id == campaign_id,
-        Lead.compatibility_score >= min_score
-    ).order_by(Lead.compatibility_score.desc()).limit(limit).all()
+    if lead.reviewsCount and lead.reviewsCount > 0:
+        final_score *= min(1.3, 1 + (lead.reviewsCount / 200))  # Boost basé sur le nombre d'avis
     
-    return compatible_leads
-
-@router.get("/campaign/{campaign_id}/suggest", response_model=List[LeadSchema])
-def suggest_leads_for_campaign(
-    campaign_id: int,
-    min_score: float = 0.3,
-    limit: int = 20,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Suggérer des leads pour une campagne spécifique.
-    Inclut des leads qui pourraient être compatibles mais ne sont pas encore associés.
-    """
-    # Vérifier que la campagne appartient à l'utilisateur
-    campaign = db.query(Campaign).filter(
-        Campaign.id == campaign_id, 
-        Campaign.user_id == current_user.id
-    ).first()
+    if lead.totalScore and lead.totalScore > 0:
+        final_score *= min(1.2, 1 + (lead.totalScore / 10))  # Boost basé sur la note
     
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campagne non trouvée")
-    
-    # Récupérer les leads analysés qui ne sont pas encore associés à une campagne
-    target_industries = campaign.target_industry if isinstance(campaign.target_industry, list) else [campaign.target_industry]
-    
-    # Construire la requête pour les leads potentiellement compatibles
-    potential_leads_query = db.query(Lead).filter(
-        Lead.campaign_id == None,
-        Lead.processed == True,
-        Lead.compatibility_score >= min_score
-    )
-    
-    # Filtrer par industrie si disponible
-    if target_industries and len(target_industries) > 0:
-        potential_leads_query = potential_leads_query.filter(Lead.industry.in_(target_industries))
-    
-    # Filtrer par géographie si disponible
-    if campaign.target_geography:
-        potential_leads_query = potential_leads_query.filter(Lead.city.like(f"%{campaign.target_geography}%"))
-    
-    # Récupérer les leads potentiels
-    potential_leads = potential_leads_query.order_by(Lead.compatibility_score.desc()).limit(limit).all()
-    
-    # Si nous n'avons pas assez de leads, on complète avec les meilleurs leads non affectés
-    if len(potential_leads) < limit:
-        additional_leads = db.query(Lead).filter(
-            Lead.campaign_id == None,
-            Lead.id.notin_([lead.id for lead in potential_leads])
-        ).order_by(Lead.compatibility_score.desc()).limit(limit - len(potential_leads)).all()
+    # Boosts spécifiques selon le type de campagne
+    if "site web" in product_name or "site internet" in product_name:
+        if "création" in product_name:
+            # Pour la création de sites web, favoriser les entreprises sans site
+            if not lead.website:
+                final_score *= 1.5
+            
+            # Mais avec une bonne réputation
+            if lead.reviewsCount and lead.reviewsCount > 10:
+                final_score *= 1.2
         
-        potential_leads.extend(additional_leads)
+        elif "refonte" in product_name or "amélioration" in product_name:
+            # Pour la refonte, favoriser les entreprises avec un site web existant
+            if lead.website:
+                final_score *= 1.4
     
-    return potential_leads
+    elif "marketing" in product_name or "publicité" in product_name:
+        # Pour le marketing, favoriser les entreprises avec une présence en ligne
+        if lead.website:
+            final_score *= 1.2
+        
+        social_count = sum(1 for x in [lead.facebooks, lead.instagrams, lead.linkedIns, lead.youtubes] 
+                           if x and len(x) > 0)
+        if social_count > 0:
+            final_score *= (1 + (social_count * 0.05))
+    
+    elif "logiciel" in product_name or "application" in product_name:
+        # Pour les logiciels, favoriser les entreprises avec une certaine taille
+        if lead.company_size:
+            if lead.company_size.lower() in ["moyenne", "grande"]:
+                final_score *= 1.3
+    
+    # Ne pas dépasser 1.0
+    return min(1.0, final_score)
